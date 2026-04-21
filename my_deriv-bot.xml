@@ -1,192 +1,47 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
-import { analyzeDigitPattern, calculateNextStake, shouldStopTrading, generateDigit, executeTradeSimulation, TradeConfig, DerivAPIClient, isOver345, }
-from '@/lib/tradingLogic';
-
-export interface Trade {
-  id: string;
-  timestamp: string;
-  digit: number;
-  prediction: string;
-  stake: number;
-  result: 'win' | 'loss' | 'pending';
-  payout: number;
-  profit: number;
-}
-
-export interface BotStats {
-  totalTrades: number;
-  wins: number;
-  losses: number;
-  totalProfit: number;
-  winRate: number;
-  currentStreak: number;
-  streakType: 'win' | 'loss' | 'none';
-  consecutiveLosses: number;
-}
-
-export type BotStatus = 'idle' | 'waiting' | 'trading' | 'paused' | 'stopped';
-
-export function useTradeBot(config: TradeConfig) {
-  const [status, setStatus] = useState<BotStatus>('idle');
-  const [isRunning, setIsRunning] = useState(false);
-  const [currentDigit, setCurrentDigit] = useState<number | null>(null);
-  const [lastDigits, setLastDigits] = useState<number[]>([]);
-  const [trades, setTrades] = useState<Trade[]>([]);
-  const [stats, setStats] = useState<BotStats>({
-    totalTrades: 0,
-    wins: 0,
-    losses: 0,
-    totalProfit: 0,
-    winRate: 0,
-    currentStreak: 0,
-    streakType: 'none',
-    consecutiveLosses: 0,
-  });
-  const apiClientRef = useRef<DerivAPIClient | null>(null);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
-  const tradeInProgressRef = useRef(false);
-  const lastDigitsRef = useRef<number[]>([]);
-
-  useEffect(() => {
-    const initializeBot = async () => {
-      try {
-        const appId = config.appId || '1089';
-        const token = config.apiToken || '';
-        const accountType = config.accountType || 'demo';
-        apiClientRef.current = new DerivAPIClient(appId, token, accountType);
-        if (token) {
-          const connected = await apiClientRef.current.connect();
-          if (connected) {
-            console.log('✓ Bot initialized with Deriv API');
-            apiClientRef.current.subscribeTicks('1HZ50V', (digit: number) => {
-              setCurrentDigit(digit);
-              lastDigitsRef.current = [...lastDigitsRef.current.slice(-9), digit];
-              setLastDigits([...lastDigitsRef.current]);
-            });
-          } else {
-            console.warn('Could not connect to Deriv API, using simulation mode');
-          }
-        } else {
-          console.log('No API token provided, using simulation mode');
-        }
-      } catch (error) {
-        console.error('Bot initialization error:', error);
-      }
-    };
-    initializeBot();
-    return () => {
-      if (apiClientRef.current) {
-        apiClientRef.current.disconnect();
-      }
-    };
-  }, [config.appId, config.apiToken, config.accountType]);
-
-  const executeTradingCycle = useCallback(async () => {
-    if (tradeInProgressRef.current || !isRunning) return;
-    try {
-      tradeInProgressRef.current = true;
-      let newDigit = currentDigit;
-      if (newDigit === null) {
-        newDigit = generateDigit();
-        setCurrentDigit(newDigit);
-        lastDigitsRef.current = [...lastDigitsRef.current.slice(-9), newDigit];
-        setLastDigits([...lastDigitsRef.current]);
-      }
-      const signal = analyzeDigitPattern(lastDigitsRef.current);
-      if (signal.shouldTrade && isOver345(newDigit)) {
-        setStatus('trading');
-        const stake = config.stakeOne;
-        const tradeId = `trade-${Date.now()}`;
-        const { isWin, payout } = executeTradeSimulation(newDigit, newDigit, 0.6);
-        const profit = payout - stake;
-        const newTrade: Trade = {
-          id: tradeId,
-          timestamp: new Date().toLocaleTimeString(),
-          digit: newDigit,
-          prediction: `Over ${newDigit}`,
-          stake,
-          result: isWin ? 'win' : 'loss',
-          payout,
-          profit,
-        };
-        setTrades(prev => [newTrade, ...prev].slice(0, 100));
-        setStats(prev => {
-          const newStreakType: 'win' | 'loss' = isWin ? 'win' : 'loss';
-          const newConsecutiveLosses = isWin ? 0 : prev.consecutiveLosses + 1;
-          const updatedStats: BotStats = {
-            totalTrades: prev.totalTrades + 1,
-            wins: prev.wins + (isWin ? 1 : 0),
-            losses: prev.losses + (isWin ? 0 : 1),
-            totalProfit: prev.totalProfit + profit,
-            winRate: 0,
-            currentStreak: isWin && prev.streakType === 'win' ? prev.currentStreak + 1 : !isWin && prev.streakType === 'loss' ? prev.currentStreak + 1 : 1,
-            streakType: newStreakType,
-            consecutiveLosses: newConsecutiveLosses,
-          };
-          updatedStats.winRate = updatedStats.totalTrades > 0 ? (updatedStats.wins / updatedStats.totalTrades) * 100 : 0;
-          if (shouldStopTrading(newConsecutiveLosses, updatedStats.totalProfit, config.stopLoss, config.maxConsecutiveLosses)) {
-            setIsRunning(false);
-            setStatus('stopped');
-          }
-          return updatedStats;
-        });
-      } else {
-        setStatus('waiting');
-      }
-    } catch (error) {
-      console.error('Error in trading cycle:', error);
-      setStatus('paused');
-    } finally {
-      tradeInProgressRef.current = false;
-    }
-  }, [isRunning, currentDigit, config]);
-
-  const startBot = useCallback(() => {
-    setIsRunning(true);
-    setStatus('waiting');
-    lastDigitsRef.current = [];
-    setLastDigits([]);
-    intervalRef.current = setInterval(() => {
-      executeTradingCycle();
-    }, 1000);
-  }, [executeTradingCycle]);
-
-  const stopBot = useCallback(() => {
-    setIsRunning(false);
-    setStatus('stopped');
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-  }, []);
-
-  const resetStats = useCallback(() => {
-    setTrades([]);
-    setStats({
-      totalTrades: 0,
-      wins: 0,
-      losses: 0,
-      totalProfit: 0,
-      winRate: 0,
-      currentStreak: 0,
-      streakType: 'none',
-      consecutiveLosses: 0,
-    });
-    setCurrentDigit(null);
-    setLastDigits([]);
-    lastDigitsRef.current = [];
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-      }
-      if (apiClientRef.current) {
-        apiClientRef.current.disconnect();
-      }
-    };
-  }, []);
-
-  return { status, isRunning, currentDigit, lastDigits, trades, stats, startBot, stopBot, resetStats };
-}
+<?xml version="1.0" encoding="UTF-8"?>
+<bot>
+    <strategy>
+        <name>Digit Analysis and Over/Under Predictor</name>
+        <description>A trading bot that uses digit analysis for predicting over/under outcomes.</description>
+        <market>Digital Options</market>
+        <timeframe>60s</timeframe>
+        <conditions>
+            <condition>
+                <type>digit</type>
+                <digit>1</digit>
+                <threshold>2</threshold>
+            </condition>
+            <condition>
+                <type>over</type>
+                <threshold>5</threshold>
+            </condition>
+            <condition>
+                <type>under</type>
+                <threshold>4</threshold>
+            </condition>
+        </conditions>
+        <actions>
+            <action>
+                <type>buy</type>
+                <option>over</option>
+                <amount>10</amount>
+            </action>
+            <action>
+                <type>buy</type>
+                <option>under</option>
+                <amount>10</amount>
+            </action>
+        </actions>
+        <trading>
+            <entry>
+                <rule>analyzeDigits</rule>
+            </entry>
+        </trading>
+    </strategy>
+    <log>
+        <entry>
+            <timestamp>2026-04-21 12:31:30</timestamp>
+            <message>Bot started</message>
+        </entry>
+    </log>
+</bot>
